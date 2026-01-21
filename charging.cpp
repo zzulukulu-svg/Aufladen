@@ -6,31 +6,25 @@
 #include <powrprof.h>
 #include <shellapi.h>
 #include <string>
-#include <unordered_map>
-#include <mutex>
 #include <cmath>
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "user32.lib")
-#pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "shell32.lib")
 
 using namespace Gdiplus;
 
 // ============================================================================
-// KONFIGURATION & KONSTANTEN
+// KONFIGURATION
 // ============================================================================
 
 namespace Config {
     constexpr int HUD_SIZE = 350;
-    constexpr BYTE DRAG_ALPHA = 175;
     constexpr int ANIM_FRAMES = 30;
     constexpr int HOLD_FRAMES = 120;
     constexpr int FADEOUT_FRAMES = 20;
     constexpr int TIMER_INTERVAL_MS = 16;
-    constexpr wchar_t MUTEX_NAME[] = L"Global\\BatteryHUDMonolith";
     constexpr wchar_t WINDOW_CLASS[] = L"BatteryHUDClass";
 }
 
@@ -41,16 +35,8 @@ namespace Config {
 #define TRAY_ICON_ID 1
 
 // ============================================================================
-// DATENSTRUKTUREN
+// HUD STATE
 // ============================================================================
-
-struct WindowState {
-    bool wasLayered;
-    BYTE originalAlpha;
-    DWORD originalFlags;
-
-    WindowState() : wasLayered(false), originalAlpha(255), originalFlags(0) {}
-};
 
 struct HUDState {
     bool isVisible = false;
@@ -78,86 +64,10 @@ struct HUDState {
 };
 
 // ============================================================================
-// GLOBALER STATE (Thread-Safe)
-// ============================================================================
-
-class GlobalState {
-public:
-    static GlobalState& instance() {
-        static GlobalState inst;
-        return inst;
-    }
-
-    void addDragState(HWND hwnd, const WindowState& state) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_dragStates[hwnd] = state;
-    }
-
-    bool removeDragState(HWND hwnd, WindowState& outState) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        auto it = m_dragStates.find(hwnd);
-        if (it != m_dragStates.end()) {
-            outState = it->second;
-            m_dragStates.erase(it);
-            return true;
-        }
-        return false;
-    }
-
-    HUDState& hud() { return m_hud; }
-
-private:
-    GlobalState() = default;
-    std::unordered_map<HWND, WindowState> m_dragStates;
-    std::mutex m_mutex;
-    HUDState m_hud;
-};
-
-// ============================================================================
 // HILFSFUNKTIONEN
 // ============================================================================
 
 namespace Utils {
-    bool SetTaskbarSeconds(bool enable) {
-        HKEY hKey;
-        DWORD val = enable ? 1 : 0;
-
-        LONG result = RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
-            0,
-            KEY_SET_VALUE,
-            &hKey
-        );
-
-        if (result != ERROR_SUCCESS) return false;
-
-        result = RegSetValueExW(
-            hKey,
-            L"ShowSecondsInSystemClock",
-            0,
-            REG_DWORD,
-            reinterpret_cast<const BYTE*>(&val),
-            sizeof(val)
-        );
-
-        RegCloseKey(hKey);
-
-        if (result == ERROR_SUCCESS) {
-            SendMessageTimeoutW(
-                HWND_BROADCAST,
-                WM_SETTINGCHANGE,
-                0,
-                reinterpret_cast<LPARAM>(L"TraySettings"),
-                SMTO_ABORTIFHUNG,
-                2000,
-                nullptr
-            );
-        }
-
-        return result == ERROR_SUCCESS;
-    }
-
     inline float EaseOutBack(float t) {
         constexpr float c1 = 1.70158f;
         constexpr float c3 = c1 + 1.0f;
@@ -182,7 +92,7 @@ namespace Utils {
 }
 
 // ============================================================================
-// RENDERING ENGINE
+// RENDERING
 // ============================================================================
 
 class HUDRenderer {
@@ -301,48 +211,7 @@ private:
 };
 
 // ============================================================================
-// WINDOW TRANSPARENCY MANAGER
-// ============================================================================
-
-class TransparencyManager {
-public:
-    static void BeginDrag(HWND hwnd) {
-        LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        bool wasLayered = (exStyle & WS_EX_LAYERED) != 0;
-
-        WindowState state;
-        state.wasLayered = wasLayered;
-
-        if (wasLayered) {
-            GetLayeredWindowAttributes(hwnd, nullptr, &state.originalAlpha, &state.originalFlags);
-        }
-
-        GlobalState::instance().addDragState(hwnd, state);
-
-        if (!wasLayered) {
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exStyle | WS_EX_LAYERED);
-        }
-
-        SetLayeredWindowAttributes(hwnd, 0, Config::DRAG_ALPHA, LWA_ALPHA);
-    }
-
-    static void EndDrag(HWND hwnd) {
-        WindowState state;
-        if (GlobalState::instance().removeDragState(hwnd, state)) {
-            if (state.wasLayered) {
-                SetLayeredWindowAttributes(hwnd, 0, state.originalAlpha, state.originalFlags);
-            }
-            else {
-                SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
-                LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exStyle & ~WS_EX_LAYERED);
-            }
-        }
-    }
-};
-
-// ============================================================================
-// TRAY ICON MANAGER
+// TRAY ICON
 // ============================================================================
 
 class TrayIconManager {
@@ -355,7 +224,7 @@ public:
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_TRAYICON;
         nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-        wcscpy_s(nid.szTip, L"Battery HUD - Aktiv");
+        wcscpy_s(nid.szTip, L"Battery HUD");
 
         Shell_NotifyIconW(NIM_ADD, &nid);
     }
@@ -385,12 +254,13 @@ public:
 };
 
 // ============================================================================
-// EVENT CALLBACKS
+// WINDOW PROCEDURE
 // ============================================================================
 
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    static HUDRenderer renderer;
+HUDState g_hud;
+HUDRenderer g_renderer;
 
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE:
         TrayIconManager::Create(hwnd);
@@ -405,12 +275,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IDM_TEST: {
-            auto& hud = GlobalState::instance().hud();
             BYTE percent;
             bool isCharging;
 
             if (Utils::GetBatteryStatus(percent, isCharging)) {
-                hud.startAnimation(percent);
+                g_hud.startAnimation(percent);
                 SetTimer(hwnd, 1, Config::TIMER_INTERVAL_MS, nullptr);
             }
             return 0;
@@ -422,14 +291,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         break;
 
     case WM_POWERBROADCAST:
-        if (wParam == PBT_APMPOWERSTATUSCHANGE || wParam == PBT_POWERSETTINGCHANGE) {
-            auto& hud = GlobalState::instance().hud();
-            if (!hud.isVisible) {
+        if (wParam == PBT_APMPOWERSTATUSCHANGE) {
+            if (!g_hud.isVisible) {
                 BYTE percent;
                 bool isCharging;
 
                 if (Utils::GetBatteryStatus(percent, isCharging) && isCharging) {
-                    hud.startAnimation(percent);
+                    g_hud.startAnimation(percent);
                     SetTimer(hwnd, 1, Config::TIMER_INTERVAL_MS, nullptr);
                 }
             }
@@ -438,25 +306,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_TIMER:
         if (wParam == 1) {
-            auto& hud = GlobalState::instance().hud();
-
-            if (!hud.isFadingOut) {
-                if (hud.animFrame < Config::ANIM_FRAMES) {
-                    hud.animFrame++;
+            if (!g_hud.isFadingOut) {
+                if (g_hud.animFrame < Config::ANIM_FRAMES) {
+                    g_hud.animFrame++;
                 }
-                else if (++hud.holdFrame > Config::HOLD_FRAMES) {
-                    hud.isFadingOut = true;
-                    hud.holdFrame = Config::FADEOUT_FRAMES;
+                else if (++g_hud.holdFrame > Config::HOLD_FRAMES) {
+                    g_hud.isFadingOut = true;
+                    g_hud.holdFrame = Config::FADEOUT_FRAMES;
                 }
             }
             else {
-                if (--hud.holdFrame <= 0) {
-                    hud.reset();
+                if (--g_hud.holdFrame <= 0) {
+                    g_hud.reset();
                     KillTimer(hwnd, 1);
                 }
             }
 
-            renderer.Render(hwnd, hud);
+            g_renderer.Render(hwnd, g_hud);
         }
         return 0;
 
@@ -472,160 +338,62 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return 0;
 }
 
-void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
-    LONG idObj, LONG idChild, DWORD thread, DWORD time)
-{
-    if (idObj != OBJID_WINDOW || idChild != CHILDID_SELF) return;
-    if (!hwnd || !IsWindowVisible(hwnd)) return;
-
-    switch (event) {
-    case EVENT_SYSTEM_MOVESIZESTART:
-        TransparencyManager::BeginDrag(hwnd);
-        break;
-
-    case EVENT_SYSTEM_MOVESIZEEND:
-        TransparencyManager::EndDrag(hwnd);
-        break;
-    }
-}
-
 // ============================================================================
-// APPLICATION CLASS
+// MAIN
 // ============================================================================
 
-class Application {
-public:
-    Application() : m_instance(nullptr), m_hudWindow(nullptr), m_hook(nullptr), m_gdiplusToken(0) {}
-
-    ~Application() {
-        Cleanup();
-    }
-
-    bool Initialize(HINSTANCE hInstance) {
-        m_instance = hInstance;
-
-        GdiplusStartupInput gdiplusStartupInput;
-        if (GdiplusStartup(&m_gdiplusToken, &gdiplusStartupInput, nullptr) != Ok) {
-            return false;
-        }
-
-        Utils::SetTaskbarSeconds(true);
-
-        WNDCLASSW wc = {};
-        wc.lpfnWndProc = WndProc;
-        wc.hInstance = m_instance;
-        wc.lpszClassName = Config::WINDOW_CLASS;
-        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-
-        if (!RegisterClassW(&wc)) return false;
-
-        m_hudWindow = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-            Config::WINDOW_CLASS,
-            L"Battery HUD",
-            WS_POPUP,
-            0, 0, 1, 1,
-            nullptr, nullptr,
-            m_instance,
-            nullptr
-        );
-
-        if (!m_hudWindow) return false;
-
-        ShowWindow(m_hudWindow, SW_SHOW);
-
-        m_hook = SetWinEventHook(
-            EVENT_SYSTEM_MOVESIZESTART,
-            EVENT_SYSTEM_MOVESIZEEND,
-            nullptr,
-            WinEventProc,
-            0, 0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
-        );
-
-        return m_hook != nullptr;
-    }
-
-    int Run() {
-        MSG msg;
-        while (GetMessageW(&msg, nullptr, 0, 0)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        return static_cast<int>(msg.wParam);
-    }
-
-    void Cleanup() {
-        if (m_hook) {
-            UnhookWinEvent(m_hook);
-            m_hook = nullptr;
-        }
-
-        if (m_hudWindow) {
-            DestroyWindow(m_hudWindow);
-            m_hudWindow = nullptr;
-        }
-
-        if (m_instance) {
-            UnregisterClassW(Config::WINDOW_CLASS, m_instance);
-        }
-
-        if (m_gdiplusToken) {
-            GdiplusShutdown(m_gdiplusToken);
-            m_gdiplusToken = 0;
-        }
-    }
-
-private:
-    HINSTANCE m_instance;
-    HWND m_hudWindow;
-    HWINEVENTHOOK m_hook;
-    ULONG_PTR m_gdiplusToken;
-};
-
-// ============================================================================
-// ENTRY POINT
-// ============================================================================
-
-int APIENTRY wWinMain(
-    _In_ HINSTANCE hInstance,
-    _In_opt_ HINSTANCE hPrevInstance,
-    _In_ LPWSTR lpCmdLine,
-    _In_ int nCmdShow)
-{
-    HANDLE hMutex = CreateMutexW(nullptr, TRUE, Config::MUTEX_NAME);
-    if (!hMutex) return -1;
-
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        CloseHandle(hMutex);
+int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
+    // Einfache Einzelinstanz-Prüfung (weniger verdächtig als globaler Mutex)
+    HWND existing = FindWindowW(Config::WINDOW_CLASS, nullptr);
+    if (existing) {
         MessageBoxW(nullptr, L"Battery HUD läuft bereits!", L"Info", MB_OK | MB_ICONINFORMATION);
         return 0;
     }
 
-    Application app;
-    int exitCode = 0;
-
-    if (app.Initialize(hInstance)) {
-        MessageBoxW(nullptr,
-            L"Battery HUD ist aktiv!\n\n"
-            L"→ Tray-Icon (Rechtsklick für Menü)\n"
-            L"→ Ladekabel einstecken = Animation\n"
-            L"→ Fenster verschieben = Transparent",
-            L"Battery HUD",
-            MB_OK | MB_ICONINFORMATION);
-
-        exitCode = app.Run();
-    }
-    else {
-        exitCode = -1;
+    ULONG_PTR gdiplusToken;
+    GdiplusStartupInput gdiplusStartupInput;
+    if (GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, nullptr) != Ok) {
+        return -1;
     }
 
-    app.Cleanup();
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = Config::WINDOW_CLASS;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
 
-    if (hMutex) {
-        ReleaseMutex(hMutex);
-        CloseHandle(hMutex);
+    if (!RegisterClassW(&wc)) {
+        GdiplusShutdown(gdiplusToken);
+        return -1;
     }
 
-    return exitCode;
+    HWND hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+        Config::WINDOW_CLASS,
+        L"Battery HUD",
+        WS_POPUP,
+        0, 0, 1, 1,
+        nullptr, nullptr,
+        hInstance,
+        nullptr
+    );
+
+    if (!hwnd) {
+        UnregisterClassW(Config::WINDOW_CLASS, hInstance);
+        GdiplusShutdown(gdiplusToken);
+        return -1;
+    }
+
+    ShowWindow(hwnd, SW_SHOW);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    UnregisterClassW(Config::WINDOW_CLASS, hInstance);
+    GdiplusShutdown(gdiplusToken);
+
+    return static_cast<int>(msg.wParam);
 }
