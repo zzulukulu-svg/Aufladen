@@ -5,13 +5,17 @@
 #include <gdiplus.h>
 #include <powrprof.h>
 #include <shellapi.h>
+#include <commdlg.h>
+#include <shlobj.h>
 #include <string>
 #include <cmath>
+#include <fstream>
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "comdlg32.lib")
 
 using namespace Gdiplus;
 
@@ -22,11 +26,14 @@ namespace Config {
     constexpr int FADEOUT_FRAMES = 20;
     constexpr int TIMER_INTERVAL_MS = 16;
     constexpr wchar_t WINDOW_CLASS[] = L"BatteryHUDClass";
+    constexpr wchar_t CONFIG_FILE[] = L"\\BatteryHUD\\c.dat";
 }
 
 #define WM_TRAYICON (WM_USER + 1)
 #define IDM_EXIT 1001
 #define IDM_TEST 1002
+#define IDM_COLOR 1003
+#define IDM_RESET 1004
 #define TRAY_ICON_ID 1
 
 struct HUDState {
@@ -36,6 +43,8 @@ struct HUDState {
     bool isFadingOut = false;
     BYTE batteryPercent = 0;
     Color themeColor = Color(255, 0, 230, 120);
+    Color customColor = Color(255, 0, 230, 120);
+    bool useCustomColor = false;
 
     void reset() {
         isVisible = false;
@@ -46,11 +55,27 @@ struct HUDState {
 
     void startAnimation(BYTE percent) {
         batteryPercent = (percent > 100) ? 100 : percent;
-        themeColor = (batteryPercent < 20) ? Color(255, 255, 50, 50) : Color(255, 0, 230, 120);
+
+        if (useCustomColor) {
+            themeColor = customColor;
+        }
+        else {
+            themeColor = (batteryPercent < 20) ? Color(255, 255, 50, 50) : Color(255, 0, 230, 120);
+        }
+
         isVisible = true;
         isFadingOut = false;
         animFrame = 0;
         holdFrame = 0;
+    }
+
+    void setCustomColor(Color color) {
+        customColor = color;
+        useCustomColor = true;
+    }
+
+    void resetColor() {
+        useCustomColor = false;
     }
 };
 
@@ -75,6 +100,80 @@ namespace Utils {
         outIsCharging = (sps.ACLineStatus == 1);
 
         return true;
+    }
+
+    bool ChooseColor(HWND hwnd, Color& color) {
+        static COLORREF customColors[16] = { 0 };
+
+        CHOOSECOLOR cc = {};
+        cc.lStructSize = sizeof(CHOOSECOLOR);
+        cc.hwndOwner = hwnd;
+        cc.rgbResult = RGB(color.GetR(), color.GetG(), color.GetB());
+        cc.lpCustColors = customColors;
+        cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+
+        if (ChooseColor(&cc)) {
+            color = Color(255, GetRValue(cc.rgbResult), GetGValue(cc.rgbResult), GetBValue(cc.rgbResult));
+            return true;
+        }
+        return false;
+    }
+
+    std::wstring GetConfigPath() {
+        wchar_t path[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, path))) {
+            std::wstring configPath = path;
+            configPath += Config::CONFIG_FILE;
+            return configPath;
+        }
+        return L"";
+    }
+
+    void SaveColor(const Color& color) {
+        std::wstring configPath = GetConfigPath();
+        if (configPath.empty()) return;
+
+        std::wstring dir = configPath.substr(0, configPath.find_last_of(L'\\'));
+        CreateDirectoryW(dir.c_str(), nullptr);
+
+        std::ofstream file(configPath, std::ios::binary);
+        if (file.is_open()) {
+            BYTE r = color.GetR();
+            BYTE g = color.GetG();
+            BYTE b = color.GetB();
+            file.write(reinterpret_cast<char*>(&r), 1);
+            file.write(reinterpret_cast<char*>(&g), 1);
+            file.write(reinterpret_cast<char*>(&b), 1);
+            file.close();
+        }
+    }
+
+    bool LoadColor(Color& color) {
+        std::wstring configPath = GetConfigPath();
+        if (configPath.empty()) return false;
+
+        std::ifstream file(configPath, std::ios::binary);
+        if (file.is_open()) {
+            BYTE r, g, b;
+            file.read(reinterpret_cast<char*>(&r), 1);
+            file.read(reinterpret_cast<char*>(&g), 1);
+            file.read(reinterpret_cast<char*>(&b), 1);
+
+            if (file.gcount() == 1) {
+                color = Color(255, r, g, b);
+                file.close();
+                return true;
+            }
+            file.close();
+        }
+        return false;
+    }
+
+    void DeleteConfig() {
+        std::wstring configPath = GetConfigPath();
+        if (!configPath.empty()) {
+            DeleteFileW(configPath.c_str());
+        }
     }
 }
 
@@ -223,6 +322,8 @@ public:
 
         HMENU hMenu = CreatePopupMenu();
         AppendMenuW(hMenu, MF_STRING, IDM_TEST, L"Animation testen");
+        AppendMenuW(hMenu, MF_STRING, IDM_COLOR, L"Farbe wählen");
+        AppendMenuW(hMenu, MF_STRING, IDM_RESET, L"Farbe zurücksetzen");
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Beenden");
 
@@ -257,6 +358,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_hud.startAnimation(percent);
                 SetTimer(hwnd, 1, Config::TIMER_INTERVAL_MS, nullptr);
             }
+            return 0;
+        }
+        case IDM_COLOR: {
+            Color newColor = g_hud.customColor;
+            if (Utils::ChooseColor(hwnd, newColor)) {
+                g_hud.setCustomColor(newColor);
+                Utils::SaveColor(newColor);
+            }
+            return 0;
+        }
+        case IDM_RESET: {
+            g_hud.resetColor();
+            Utils::DeleteConfig();
             return 0;
         }
         case IDM_EXIT:
@@ -324,6 +438,11 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     GdiplusStartupInput gdiplusStartupInput;
     if (GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, nullptr) != Ok) {
         return -1;
+    }
+
+    Color savedColor;
+    if (Utils::LoadColor(savedColor)) {
+        g_hud.setCustomColor(savedColor);
     }
 
     WNDCLASSW wc = {};
